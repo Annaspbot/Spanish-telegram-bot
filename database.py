@@ -4,6 +4,7 @@ database.py
 прогресс по интервальному повторению (упрощённый алгоритм SM-2).
 """
 
+import json
 import os
 import sqlite3
 import time
@@ -89,6 +90,24 @@ def init_db():
             next_review INTEGER DEFAULT 0,   -- unix timestamp
             last_result TEXT,
             UNIQUE(user_id, item_type, item_id)
+        )
+        """)
+
+        # Сессия текущего урока — хранится в БД (не в памяти процесса), чтобы
+        # пользователь мог продолжить урок с того же места даже после
+        # перезапуска бота (например, при редеплое на Railway).
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS lesson_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            item_type TEXT NOT NULL,       -- пока только 'word'
+            item_ids TEXT NOT NULL,        -- JSON-список id в порядке показа за урок
+            current_index INTEGER DEFAULT 0,
+            correct_count INTEGER DEFAULT 0,
+            almost_count INTEGER DEFAULT 0,
+            wrong_count INTEGER DEFAULT 0,
+            started_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'   -- 'active' | 'completed'
         )
         """)
 
@@ -273,3 +292,96 @@ def get_stats(user_id):
             "seen_conjugations": seen_conj,
             "mastered_words": mastered_words,
         }
+
+
+# ---------------------------------------------------------------------------
+# Слова по id (нужно для восстановления сессии урока по сохранённым id)
+# ---------------------------------------------------------------------------
+
+def get_word_by_id(word_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM words WHERE id = ?", (word_id,)).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Сессии урока — хранятся в БД, а не в памяти процесса, поэтому переживают
+# перезапуск бота (важно для деплоя на Railway, где рестарты случаются
+# при каждом обновлении кода).
+# ---------------------------------------------------------------------------
+
+def create_lesson_session(user_id: int, item_type: str, item_ids: list):
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO lesson_sessions
+                (user_id, item_type, item_ids, current_index,
+                 correct_count, almost_count, wrong_count, started_at, status)
+            VALUES (?, ?, ?, 0, 0, 0, 0, ?, 'active')
+            """,
+            (user_id, item_type, json.dumps(item_ids), int(time.time())),
+        )
+        conn.commit()
+        session_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM lesson_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return dict(row)
+
+
+def get_active_session(user_id: int, item_type: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM lesson_sessions
+            WHERE user_id = ? AND item_type = ? AND status = 'active'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, item_type),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_session(session_id: int):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM lesson_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_lesson_answer(session_id: int, outcome: str):
+    """
+    outcome: 'correct' | 'almost' | 'wrong'.
+    Увеличивает соответствующий счётчик и сдвигает current_index на 1.
+    Возвращает обновлённую строку сессии.
+    """
+    column = {
+        "correct": "correct_count",
+        "almost": "almost_count",
+        "wrong": "wrong_count",
+    }[outcome]
+
+    with get_conn() as conn:
+        conn.execute(
+            f"""
+            UPDATE lesson_sessions
+            SET {column} = {column} + 1,
+                current_index = current_index + 1
+            WHERE id = ?
+            """,
+            (session_id,),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM lesson_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return dict(row)
+
+
+def complete_lesson_session(session_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lesson_sessions SET status = 'completed' WHERE id = ?",
+            (session_id,),
+        )

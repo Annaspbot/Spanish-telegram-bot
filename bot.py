@@ -11,9 +11,11 @@ bot.py
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
+import time
 
 try:
     # Только для локальной разработки: подтягивает переменные из файла .env.
@@ -41,6 +43,7 @@ from aiogram.types import (
 
 import database as db
 import spaced_repetition as sr
+from text_utils import compare_answer, accent_hint
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,9 +52,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 router = Router()
 
-# В памяти: какое слово/форма сейчас "активны" в сессии пользователя,
-# чтобы не плодить сложный FSM для простого drill-режима.
-active_word: dict[int, dict] = {}
+# Сколько слов дать за один урок (/learn). Сама сессия урока хранится в БД
+# (таблица lesson_sessions), а не в памяти процесса — поэтому переживает
+# перезапуск бота (важно для Railway, где рестарт происходит при каждом деплое).
+LESSON_SIZE = 20
+
+# Тренажёр спряжений пока держит текущую форму в памяти процесса на короткое
+# время одного вопроса — это отдельная, более простая механика, не меняем её
+# в этой правке.
 active_conj: dict[int, dict] = {}
 
 
@@ -68,21 +76,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 Учить слова/фразы", callback_data="menu_learn")],
         [InlineKeyboardButton(text="🔤 Тренажёр спряжений", callback_data="menu_verbs")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
-    ])
-
-
-def show_answer_kb(word_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👀 Показать перевод", callback_data=f"word_show:{word_id}")],
-    ])
-
-
-def know_dontknow_kb(word_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Знаю", callback_data=f"word_know:{word_id}"),
-            InlineKeyboardButton(text="❌ Не знаю", callback_data=f"word_dontknow:{word_id}"),
-        ]
     ])
 
 
@@ -124,7 +117,7 @@ async def cmd_menu(message: Message):
 @router.callback_query(F.data == "menu_learn")
 async def cb_menu_learn(callback: CallbackQuery):
     await callback.answer()
-    await send_next_word(callback.from_user.id, callback.message)
+    await cmd_learn_logic(callback.from_user.id, callback.message)
 
 
 @router.callback_query(F.data == "menu_verbs")
@@ -140,68 +133,144 @@ async def cb_menu_stats(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Режим "Слова/фразы"
+# Режим "Слова/фразы" — версия 2.0
+#
+# Урок = фиксированный список слов (до LESSON_SIZE штук), сохранённый в БД
+# в момент старта. Пользователь печатает перевод текстом; бот сравнивает
+# ответ без учёта регистра, лишних пробелов, и мягко (с подсказкой) прощает
+# отсутствие ударений/ñ. Прогресс урока (текущий индекс, счётчики) хранится
+# в таблице lesson_sessions — не в памяти процесса, поэтому переживает
+# перезапуск бота.
 # ---------------------------------------------------------------------------
+
+CATEGORY_LABELS = {
+    "verb_inf": "глагол",
+    "noun": "существительное",
+    "adjective": "прилагательное",
+    "phrase": "фраза/выражение",
+    "slang": "разговорное/сленг",
+}
+
 
 @router.message(Command("learn"))
 async def cmd_learn(message: Message):
     db.ensure_user(message.from_user.id, message.from_user.username or "")
-    await send_next_word(message.from_user.id, message)
+    await cmd_learn_logic(message.from_user.id, message)
 
 
-async def send_next_word(user_id: int, message: Message):
-    items = db.get_due_items(user_id, "word", limit=1)
-    if not items:
+async def cmd_learn_logic(user_id: int, message: Message):
+    session = db.get_active_session(user_id, "word")
+    if session:
+        ids = json.loads(session["item_ids"])
+        remaining = len(ids) - session["current_index"]
+        await message.answer(f"Продолжаем предыдущий урок ↩️ (осталось {remaining} слов)")
+        await send_lesson_word(session, message)
+        return
+
+    due = db.get_due_items(user_id, "word", limit=LESSON_SIZE)
+    if not due:
         await message.answer("Слов для повторения пока нет 🤷 Попробуй позже.")
         return
 
-    word = items[0]
-    active_word[user_id] = word
-
-    category_label = {
-        "verb_inf": "глагол",
-        "noun": "существительное",
-        "adjective": "прилагательное",
-        "phrase": "фраза/выражение",
-        "slang": "разговорное/сленг",
-    }.get(word["category"], word["category"])
-
-    text = f"🇪🇸 <b>{word['spanish']}</b>\n<i>({category_label}, {word['level']})</i>"
-    await message.answer(text, reply_markup=show_answer_kb(word["id"]))
+    item_ids = [w["id"] for w in due]
+    session = db.create_lesson_session(user_id, "word", item_ids)
+    await message.answer(f"Начинаем урок! Слов сегодня: {len(item_ids)} 📚")
+    await send_lesson_word(session, message)
 
 
-@router.callback_query(F.data.startswith("word_show:"))
-async def cb_word_show(callback: CallbackQuery):
-    word_id = int(callback.data.split(":")[1])
-    word = active_word.get(callback.from_user.id)
-    await callback.answer()
-    if not word or word["id"] != word_id:
-        await callback.message.answer("Сессия устарела, жми /learn ещё раз.")
+async def send_lesson_word(session: dict, message: Message):
+    item_ids = json.loads(session["item_ids"])
+    idx = session["current_index"]
+
+    if idx >= len(item_ids):
+        await finish_lesson(session, message)
         return
 
-    text = f"🇪🇸 <b>{word['spanish']}</b>\n➡️ {word['translation']}"
-    if word.get("example"):
-        text += f"\n\n💬 <i>{word['example']}</i>"
-    await callback.message.edit_text(text, reply_markup=know_dontknow_kb(word_id))
+    word = db.get_word_by_id(item_ids[idx])
+    if word is None:
+        # Слово могло быть удалено из базы между сессиями — пропускаем,
+        # не ломая урок целиком.
+        session = db.record_lesson_answer(session["id"], "wrong")
+        await send_lesson_word(session, message)
+        return
+
+    category_label = CATEGORY_LABELS.get(word["category"], word["category"])
+    text = (
+        f"Слово {idx + 1} из {len(item_ids)}\n\n"
+        f"🇷🇺 <b>{word['translation']}</b>\n"
+        f"<i>({category_label}, {word['level']})</i>\n\n"
+        f"Напиши перевод на испанский:"
+    )
+    await message.answer(text)
 
 
-@router.callback_query(F.data.startswith("word_know:") | F.data.startswith("word_dontknow:"))
-async def cb_word_answer(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    action, word_id_str = callback.data.split(":")
-    word_id = int(word_id_str)
-    correct = action == "word_know"
+async def process_word_answer(session: dict, message: Message):
+    item_ids = json.loads(session["item_ids"])
+    idx = session["current_index"]
 
-    await callback.answer("Записал ✅" if correct else "Ничего, повторим позже 💪")
-    await update_progress(user_id, "word", word_id, correct)
+    if idx >= len(item_ids):
+        await finish_lesson(session, message)
+        return
 
-    await callback.message.edit_reply_markup(reply_markup=continue_kb("next_word"))
+    word = db.get_word_by_id(item_ids[idx])
+    if word is None:
+        session = db.record_lesson_answer(session["id"], "wrong")
+        await send_lesson_word(session, message)
+        return
+
+    correct_answer = word["spanish"]
+    user_answer = message.text
+    outcome = compare_answer(user_answer, correct_answer)
+
+    if outcome == "correct":
+        await message.answer("✅ Верно!")
+    elif outcome == "almost":
+        hint = accent_hint(correct_answer)
+        await message.answer(
+            f"⚠️ Почти правильно!{hint}\n\n"
+            f"Правильный ответ:\n<b>{correct_answer}</b>"
+        )
+    else:
+        await message.answer(
+            f"❌ Неправильно.\n\n"
+            f"Правильный ответ:\n<b>{correct_answer}</b>\n\n"
+            f"Твой ответ:\n{user_answer}"
+        )
+
+    # Для интервального повторения "почти правильно" считаем как "не знаю" —
+    # слово вернётся на повторение раньше, но в статистике урока это отдельная,
+    # не такая строгая категория (не пугаем пользователя как явной ошибкой).
+    sr_correct = (outcome == "correct")
+    await update_progress(message.from_user.id, "word", word["id"], sr_correct)
+
+    session = db.record_lesson_answer(session["id"], outcome)
+    await send_lesson_word(session, message)
 
 
-@router.callback_query(F.data == "next_word")
-async def cb_next_word(callback: CallbackQuery):
-    await callback.answer()
-    await send_next_word(callback.from_user.id, callback.message)
+async def finish_lesson(session: dict, message: Message):
+    db.complete_lesson_session(session["id"])
+
+    total = len(json.loads(session["item_ids"]))
+    correct = session["correct_count"]
+    almost = session["almost_count"]
+    wrong = session["wrong_count"]
+    accuracy = round((correct / total) * 100) if total else 0
+
+    elapsed = int(time.time()) - session["started_at"]
+    minutes, seconds = divmod(elapsed, 60)
+    time_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
+
+    text = (
+        "🎉 <b>Урок завершён!</b>\n\n"
+        f"Всего слов: {total}\n"
+        f"✅ Правильно: {correct}\n"
+        f"⚠️ Почти правильно: {almost}\n"
+        f"❌ Ошибок: {wrong}\n"
+        f"🎯 Точность: {accuracy}%\n"
+        f"⏱ Время: {time_str}\n\n"
+        "Ещё урок — жми /learn"
+    )
+    await message.answer(text, reply_markup=main_menu_kb())
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +334,35 @@ async def handle_verb_answer(message: Message, state: FSMContext):
 async def cb_next_verb(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await send_next_verb(callback.from_user.id, callback.message, state)
+
+
+# ---------------------------------------------------------------------------
+# Общий обработчик обычного текста — обрабатывает ответы в уроке слов.
+#
+# ВАЖНО: зарегистрирован ПОСЛЕ handle_verb_answer (который фильтруется по
+# StateFilter(VerbDrill.waiting_answer)). aiogram проверяет хендлеры в порядке
+# регистрации и останавливается на первом подходящем — поэтому пока активно
+# состояние тренажёра спряжений, сообщение перехватит handle_verb_answer,
+# и только если оно не подошло (state не активен) — дойдёт сюда.
+# ---------------------------------------------------------------------------
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_plain_text(message: Message, state: FSMContext):
+    # Страховка на случай гонки состояний (не должна срабатывать в норме).
+    current_state = await state.get_state()
+    if current_state == VerbDrill.waiting_answer.state:
+        return
+
+    user_id = message.from_user.id
+    session = db.get_active_session(user_id, "word")
+    if not session:
+        await message.answer(
+            "Не совсем понял 🙂 Чтобы начать урок слов — /learn, "
+            "тренажёр спряжений — /verbs, статистика — /stats."
+        )
+        return
+
+    await process_word_answer(session, message)
 
 
 # ---------------------------------------------------------------------------
