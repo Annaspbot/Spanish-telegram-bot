@@ -65,6 +65,48 @@ active_conj: dict[int, dict] = {}
 
 class VerbDrill(StatesGroup):
     waiting_answer = State()
+    # Промежуточное состояние между "ответил" и "нажал Дальше/Меню/Закончить".
+    # Нужно, чтобы кнопка "➡️ Дальше" могла отличить "я всё ещё в тренажёре
+    # спряжений" от "я уже нигде" даже после того, как ответ уже засчитан.
+    answered = State()
+
+
+# ---------------------------------------------------------------------------
+# Универсальный выход в главное меню.
+#
+# Работает одинаково для ЛЮБОГО режима обучения — текущего и будущего —
+# без необходимости писать отдельный обработчик выхода для каждого режима.
+# Правило простое: если новый режим хранит состояние в FSMContext —
+# state.clear() уже достаточно; если хранит сессию в таблице
+# lesson_sessions — cancel_active_sessions уже достаточно; если у него есть
+# собственное in-memory хранилище (как active_conj у тренажёра спряжений) —
+# он один раз регистрирует свою функцию очистки через @register_cleanup,
+# и дальше она вызывается автоматически вместе со всеми остальными.
+# ---------------------------------------------------------------------------
+
+_cleanup_hooks: list = []
+
+
+def register_cleanup(fn):
+    """Декоратор: регистрирует функцию очистки in-memory состояния конкретного
+    режима. Вызывается автоматически внутри reset_user_state."""
+    _cleanup_hooks.append(fn)
+    return fn
+
+
+async def reset_user_state(user_id: int, state: FSMContext):
+    """Полный сброс пользователя: FSM-состояние, все активные сессии в БД
+    (независимо от режима) и in-memory состояние всех зарегистрированных
+    режимов. Вызывается из /start, /menu и кнопки '🏠 Главное меню'."""
+    await state.clear()
+    db.cancel_active_sessions(user_id)
+    for hook in _cleanup_hooks:
+        hook(user_id)
+
+
+@register_cleanup
+def _clear_active_conj(user_id: int):
+    active_conj.pop(user_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +121,21 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def continue_kb(action: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➡️ Дальше", callback_data=action)],
+def nav_kb(show_next: bool = True) -> InlineKeyboardMarkup:
+    """
+    Универсальная клавиатура навигации — добавляется к сообщениям во ВСЕХ
+    режимах обучения (слова, спряжения, и любые будущие режимы), чтобы
+    пользователь мог в любой момент пропустить текущий шаг, выйти в меню
+    или полностью закончить тренировку.
+    """
+    rows = []
+    if show_next:
+        rows.append([InlineKeyboardButton(text="➡️ Дальше", callback_data="nav:next")])
+    rows.append([
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:menu"),
+        InlineKeyboardButton(text="❌ Закончить тренировку", callback_data="nav:stop"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 TENSE_LABELS = {
@@ -96,7 +149,8 @@ TENSE_LABELS = {
 # ---------------------------------------------------------------------------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await reset_user_state(message.from_user.id, state)
     db.ensure_user(message.from_user.id, message.from_user.username or "")
     await message.answer(
         "¡Hola! 👋 Это бот для изучения испанского (уровень A2-B2).\n\n"
@@ -110,7 +164,8 @@ async def cmd_start(message: Message):
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message):
+async def cmd_menu(message: Message, state: FSMContext):
+    await reset_user_state(message.from_user.id, state)
     await message.answer("Главное меню:", reply_markup=main_menu_kb())
 
 
@@ -201,7 +256,7 @@ async def send_lesson_word(session: dict, message: Message):
         f"<i>({category_label}, {word['level']})</i>\n\n"
         f"Напиши перевод на испанский:"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=nav_kb(show_next=True))
 
 
 async def process_word_answer(session: dict, message: Message):
@@ -286,7 +341,8 @@ async def cmd_verbs(message: Message, state: FSMContext):
 async def send_next_verb(user_id: int, message: Message, state: FSMContext):
     items = db.get_due_items(user_id, "conjugation", limit=1)
     if not items:
-        await message.answer("Форм для повторения пока нет 🤷 Попробуй позже.")
+        await state.clear()
+        await message.answer("Форм для повторения пока нет 🤷 Попробуй позже.", reply_markup=main_menu_kb())
         return
 
     conj = items[0]
@@ -301,7 +357,7 @@ async def send_next_verb(user_id: int, message: Message, state: FSMContext):
         f"👤 Лицо: <b>{conj['pronoun']}</b>\n\n"
         f"Напиши правильную форму глагола:"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=nav_kb(show_next=True))
 
 
 @router.message(StateFilter(VerbDrill.waiting_answer))
@@ -310,7 +366,7 @@ async def handle_verb_answer(message: Message, state: FSMContext):
     conj = active_conj.get(user_id)
     if not conj:
         await state.clear()
-        await message.answer("Сессия устарела, жми /verbs ещё раз.")
+        await message.answer("Сессия устарела, жми /verbs ещё раз.", reply_markup=main_menu_kb())
         return
 
     user_answer = message.text.strip().lower()
@@ -318,22 +374,18 @@ async def handle_verb_answer(message: Message, state: FSMContext):
     correct = user_answer == correct_answer
 
     if correct:
-        await message.answer(f"✅ Правильно! <b>{conj['form']}</b>")
+        result_text = f"✅ Правильно! <b>{conj['form']}</b>"
     else:
-        await message.answer(
-            f"❌ Не совсем. Правильный ответ: <b>{conj['form']}</b>"
-        )
+        result_text = f"❌ Не совсем. Правильный ответ: <b>{conj['form']}</b>"
 
     await update_progress(user_id, "conjugation", conj["id"], correct)
-    await state.clear()
 
-    await message.answer("Продолжаем:", reply_markup=continue_kb("next_verb"))
+    # Не очищаем состояние полностью, а переводим в "answered" — иначе кнопка
+    # "➡️ Дальше" не сможет отличить "я всё ещё в тренажёре спряжений" от
+    # "я уже нигде" (см. cb_nav_next).
+    await state.set_state(VerbDrill.answered)
 
-
-@router.callback_query(F.data == "next_verb")
-async def cb_next_verb(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await send_next_verb(callback.from_user.id, callback.message, state)
+    await message.answer(result_text, reply_markup=nav_kb(show_next=True))
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +402,7 @@ async def cb_next_verb(callback: CallbackQuery, state: FSMContext):
 async def handle_plain_text(message: Message, state: FSMContext):
     # Страховка на случай гонки состояний (не должна срабатывать в норме).
     current_state = await state.get_state()
-    if current_state == VerbDrill.waiting_answer.state:
+    if current_state in (VerbDrill.waiting_answer.state, VerbDrill.answered.state):
         return
 
     user_id = message.from_user.id
@@ -363,6 +415,73 @@ async def handle_plain_text(message: Message, state: FSMContext):
         return
 
     await process_word_answer(session, message)
+
+
+# ---------------------------------------------------------------------------
+# Универсальная навигация (работает для ЛЮБОГО текущего или будущего режима):
+#   nav:next — пропустить текущий шаг и показать следующий
+#   nav:menu — полностью выйти в главное меню (сбрасывает всё)
+#   nav:stop — закончить текущую тренировку (со статистикой, если применимо)
+#             и вернуться в главное меню
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "nav:next")
+async def cb_nav_next(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+    current_state = await state.get_state()
+
+    if current_state in (VerbDrill.waiting_answer.state, VerbDrill.answered.state):
+        await send_next_verb(user_id, callback.message, state)
+        return
+
+    session = db.get_active_session(user_id, "word")
+    if session:
+        session = db.skip_lesson_item(session["id"])
+        await send_lesson_word(session, callback.message)
+        return
+
+    await callback.message.answer(
+        "Активная тренировка не найдена. Выбери режим:", reply_markup=main_menu_kb()
+    )
+
+
+@router.callback_query(F.data == "nav:menu")
+async def cb_nav_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await reset_user_state(callback.from_user.id, state)
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "nav:stop")
+async def cb_nav_stop(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+    current_state = await state.get_state()
+
+    # Активный урок слов — показываем итоговую статистику, как при обычном
+    # завершении урока.
+    word_session = db.get_active_session(user_id, "word")
+    if word_session:
+        await finish_lesson(word_session, callback.message)
+        await state.clear()
+        _clear_active_conj(user_id)
+        return
+
+    # Активный тренажёр спряжений — просто сообщаем об остановке.
+    if current_state in (VerbDrill.waiting_answer.state, VerbDrill.answered.state):
+        await state.clear()
+        _clear_active_conj(user_id)
+        await callback.message.answer(
+            "Тренировка спряжений остановлена.", reply_markup=main_menu_kb()
+        )
+        return
+
+    # На всякий случай — если ничего активного не нашлось.
+    await state.clear()
+    await callback.message.answer(
+        "Активная тренировка не найдена.", reply_markup=main_menu_kb()
+    )
 
 
 # ---------------------------------------------------------------------------

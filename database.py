@@ -329,16 +329,33 @@ def create_lesson_session(user_id: int, item_type: str, item_ids: list):
         return dict(row)
 
 
-def get_active_session(user_id: int, item_type: str):
+def get_active_session(user_id: int, item_type: str = None):
+    """
+    Если item_type задан — ищет активную сессию именно этого режима (как раньше).
+    Если item_type=None — ищет ЛЮБУЮ активную сессию пользователя, независимо
+    от режима. Это нужно для универсального выхода в меню (см. reset_user_state
+    и nav:* колбэки в bot.py) — новый режим, который в будущем начнёт хранить
+    свою сессию в этой же таблице, автоматически подхватится без правок здесь.
+    """
     with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM lesson_sessions
-            WHERE user_id = ? AND item_type = ? AND status = 'active'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (user_id, item_type),
-        ).fetchone()
+        if item_type:
+            row = conn.execute(
+                """
+                SELECT * FROM lesson_sessions
+                WHERE user_id = ? AND item_type = ? AND status = 'active'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id, item_type),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM lesson_sessions
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -385,3 +402,51 @@ def complete_lesson_session(session_id: int):
             "UPDATE lesson_sessions SET status = 'completed' WHERE id = ?",
             (session_id,),
         )
+
+
+def cancel_active_sessions(user_id: int, item_type: str = None):
+    """
+    Отменяет активные сессии пользователя (ставит status='cancelled'), чтобы
+    get_active_session их больше не находил. Не показывает статистику —
+    в отличие от complete_lesson_session, это "тихий" выход без экрана
+    результатов (используется при полном сбросе через /menu, /start,
+    кнопку "🏠 Главное меню").
+    Если item_type не задан — отменяет сессии ЛЮБОГО режима пользователя,
+    что делает сброс универсальным для всех текущих и будущих режимов,
+    использующих эту таблицу.
+    """
+    with get_conn() as conn:
+        if item_type:
+            conn.execute(
+                """
+                UPDATE lesson_sessions SET status = 'cancelled'
+                WHERE user_id = ? AND item_type = ? AND status = 'active'
+                """,
+                (user_id, item_type),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE lesson_sessions SET status = 'cancelled'
+                WHERE user_id = ? AND status = 'active'
+                """,
+                (user_id,),
+            )
+
+
+def skip_lesson_item(session_id: int):
+    """
+    Пропускает текущий элемент урока без записи в счётчики correct/almost/wrong
+    (используется кнопкой "➡️ Дальше" до того, как пользователь ответил).
+    Возвращает обновлённую строку сессии.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE lesson_sessions SET current_index = current_index + 1 WHERE id = ?",
+            (session_id,),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM lesson_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return dict(row)
