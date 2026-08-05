@@ -107,9 +107,18 @@ def init_db():
             almost_count INTEGER DEFAULT 0,
             wrong_count INTEGER DEFAULT 0,
             started_at INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active'   -- 'active' | 'completed'
+            status TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'completed' | 'cancelled'
+            finished_at INTEGER  -- unix timestamp, задаётся при завершении (для статистики по дням)
         )
         """)
+
+        # Миграция для баз, созданных до появления этой колонки (например,
+        # уже развёрнутой на Railway) — CREATE TABLE IF NOT EXISTS выше её
+        # не добавит, если таблица уже существует, поэтому добавляем отдельно.
+        try:
+            c.execute("ALTER TABLE lesson_sessions ADD COLUMN finished_at INTEGER")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть — миграция уже применялась раньше
 
         conn.commit()
 
@@ -304,6 +313,23 @@ def get_word_by_id(word_id: int):
         return dict(row) if row else None
 
 
+def get_conjugation_by_id(conjugation_id: int):
+    """Аналог get_word_by_id, но для конкретной формы спряжения — с join на
+    verbs, чтобы сразу получить инфинитив и перевод глагола (та же форма
+    данных, что возвращает get_due_items для item_type='conjugation')."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT c.*, v.infinitive, v.translation as verb_translation
+            FROM conjugations c
+            JOIN verbs v ON v.id = c.verb_id
+            WHERE c.id = ?
+            """,
+            (conjugation_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Сессии урока — хранятся в БД, а не в памяти процесса, поэтому переживают
 # перезапуск бота (важно для деплоя на Railway, где рестарты случаются
@@ -399,8 +425,8 @@ def record_lesson_answer(session_id: int, outcome: str):
 def complete_lesson_session(session_id: int):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE lesson_sessions SET status = 'completed' WHERE id = ?",
-            (session_id,),
+            "UPDATE lesson_sessions SET status = 'completed', finished_at = ? WHERE id = ?",
+            (int(time.time()), session_id),
         )
 
 
@@ -436,9 +462,9 @@ def cancel_active_sessions(user_id: int, item_type: str = None):
 
 def skip_lesson_item(session_id: int):
     """
-    Пропускает текущий элемент урока без записи в счётчики correct/almost/wrong
-    (используется кнопкой "➡️ Дальше" до того, как пользователь ответил).
-    Возвращает обновлённую строку сессии.
+    Пропускает текущий элемент урока без записи в счётчики correct/almost/wrong.
+    Из UI сейчас не вызывается (кнопку "Дальше" убрали в версии 2.0), но
+    оставлена как утилита — может пригодиться для будущих режимов.
     """
     with get_conn() as conn:
         conn.execute(
@@ -450,3 +476,196 @@ def skip_lesson_item(session_id: int):
             "SELECT * FROM lesson_sessions WHERE id = ?", (session_id,)
         ).fetchone()
         return dict(row)
+
+
+def count_new_items(user_id: int, item_type: str) -> int:
+    """
+    Сколько ещё есть предметов (слов или форм спряжения), которые
+    пользователь НИ РАЗУ не видел (нет строки в user_progress). Используется,
+    чтобы показать "новые слова на сегодня закончились" вместо обычного
+    приветствия урока, когда остались только повторения.
+    """
+    with get_conn() as conn:
+        if item_type == "word":
+            row = conn.execute(
+                """
+                SELECT COUNT(*) c FROM words w
+                WHERE w.id NOT IN (
+                    SELECT item_id FROM user_progress
+                    WHERE user_id = ? AND item_type = 'word'
+                )
+                """,
+                (user_id,),
+            ).fetchone()
+        elif item_type == "conjugation":
+            row = conn.execute(
+                """
+                SELECT COUNT(*) c FROM conjugations c
+                WHERE c.id NOT IN (
+                    SELECT item_id FROM user_progress
+                    WHERE user_id = ? AND item_type = 'conjugation'
+                )
+                """,
+                (user_id,),
+            ).fetchone()
+        else:
+            return 0
+        return row["c"] if row else 0
+
+
+def get_admin_stats():
+    """
+    Статистика по ВСЕМ пользователям бота (не по одному) — для владельца.
+    Использует те же таблицы, что и get_extended_stats, просто без фильтра
+    по user_id, плюс окна активности (сегодня/неделя/месяц).
+    """
+    now = int(time.time())
+    day_ago = now - 86400
+    week_ago = now - 7 * 86400
+    month_ago = now - 30 * 86400
+
+    with get_conn() as conn:
+        total_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+
+        new_today = conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE created_at >= ?", (day_ago,)
+        ).fetchone()["c"]
+
+        def active_since(ts):
+            row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT user_id) c FROM lesson_sessions
+                WHERE started_at >= ?
+                   OR (finished_at IS NOT NULL AND finished_at >= ?)
+                """,
+                (ts, ts),
+            ).fetchone()
+            return row["c"]
+
+        active_today = active_since(day_ago)
+        active_week = active_since(week_ago)
+        active_month = active_since(month_ago)
+
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS sessions,
+                COALESCE(SUM(correct_count), 0) AS correct,
+                COALESCE(SUM(almost_count), 0) AS almost,
+                COALESCE(SUM(wrong_count), 0) AS wrong,
+                COALESCE(SUM(correct_count + almost_count + wrong_count), 0) AS total_items,
+                COALESCE(SUM(
+                    CASE WHEN finished_at IS NOT NULL
+                         THEN finished_at - started_at ELSE 0 END
+                ), 0) AS time_seconds
+            FROM lesson_sessions
+            WHERE status = 'completed'
+            """
+        ).fetchone()
+
+        sessions = totals["sessions"]
+        avg_items = round(totals["total_items"] / sessions, 1) if sessions else 0
+        avg_minutes = round(totals["time_seconds"] / sessions / 60, 1) if sessions else 0
+
+        word_users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) c FROM lesson_sessions "
+            "WHERE item_type = 'word' AND status = 'completed'"
+        ).fetchone()["c"]
+        conj_users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) c FROM lesson_sessions "
+            "WHERE item_type = 'conjugation' AND status = 'completed'"
+        ).fetchone()["c"]
+
+        total_answers = totals["correct"] + totals["almost"] + totals["wrong"]
+        accuracy = round(totals["correct"] / total_answers * 100) if total_answers else 0
+
+        return {
+            "total_users": total_users,
+            "new_today": new_today,
+            "active_today": active_today,
+            "active_week": active_week,
+            "active_month": active_month,
+            "sessions_completed": sessions,
+            "avg_items_per_session": avg_items,
+            "avg_session_minutes": avg_minutes,
+            "accuracy": accuracy,
+            "word_users": word_users,
+            "conj_users": conj_users,
+        }
+
+
+def get_extended_stats(user_id: int):
+    """
+    Расширенная статистика — вся строится из уже существующих данных
+    (lesson_sessions + user_progress), без отдельной системы XP/уровней.
+    """
+    with get_conn() as conn:
+        total_words = conn.execute("SELECT COUNT(*) c FROM words").fetchone()["c"]
+        total_conj = conn.execute("SELECT COUNT(*) c FROM conjugations").fetchone()["c"]
+
+        seen_words = conn.execute(
+            "SELECT COUNT(*) c FROM user_progress WHERE user_id=? AND item_type='word'",
+            (user_id,),
+        ).fetchone()["c"]
+        mastered_words = conn.execute(
+            "SELECT COUNT(*) c FROM user_progress WHERE user_id=? AND item_type='word' AND repetitions>=5",
+            (user_id,),
+        ).fetchone()["c"]
+        seen_conj = conn.execute(
+            "SELECT COUNT(*) c FROM user_progress WHERE user_id=? AND item_type='conjugation'",
+            (user_id,),
+        ).fetchone()["c"]
+        mastered_conj = conn.execute(
+            "SELECT COUNT(*) c FROM user_progress WHERE user_id=? AND item_type='conjugation' AND repetitions>=5",
+            (user_id,),
+        ).fetchone()["c"]
+
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS sessions,
+                COALESCE(SUM(correct_count), 0) AS correct,
+                COALESCE(SUM(almost_count), 0) AS almost,
+                COALESCE(SUM(wrong_count), 0) AS wrong,
+                COALESCE(SUM(
+                    CASE WHEN finished_at IS NOT NULL
+                         THEN finished_at - started_at ELSE 0 END
+                ), 0) AS time_seconds
+            FROM lesson_sessions
+            WHERE user_id = ? AND status = 'completed'
+            """,
+            (user_id,),
+        ).fetchone()
+
+        by_day = conn.execute(
+            """
+            SELECT
+                date(finished_at, 'unixepoch') AS day,
+                SUM(correct_count + almost_count + wrong_count) AS items
+            FROM lesson_sessions
+            WHERE user_id = ? AND status = 'completed' AND finished_at IS NOT NULL
+            GROUP BY day
+            """,
+            (user_id,),
+        ).fetchall()
+
+        days_active = len(by_day)
+        best_day = max((row["items"] for row in by_day), default=0)
+        avg_per_day = round(sum(row["items"] for row in by_day) / days_active) if days_active else 0
+
+        return {
+            "total_words": total_words,
+            "total_conjugations": total_conj,
+            "seen_words": seen_words,
+            "mastered_words": mastered_words,
+            "seen_conjugations": seen_conj,
+            "mastered_conjugations": mastered_conj,
+            "sessions_completed": totals["sessions"],
+            "correct": totals["correct"],
+            "almost": totals["almost"],
+            "wrong": totals["wrong"],
+            "time_seconds": totals["time_seconds"],
+            "days_active": days_active,
+            "best_day": best_day,
+            "avg_per_day": avg_per_day,
+        }
